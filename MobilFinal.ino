@@ -3,335 +3,368 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_HMC5883_U.h>
+#include <QMC5883LCompass.h>
 
-/* ===================== WIFI ===================== */
-const char* WIFI_SSID = "XXX";
-const char* WIFI_PASS = "Abcdefghijklmn";
-
-/* ===================== MQTT ===================== */
-const char* MQTT_HOST = "3d334b6b47764fffb7480823a8402c8c.s1.eu.hivemq.cloud";
-const int   MQTT_PORT = 8883;
-const char* MQTT_USER = "mobil";
-const char* MQTT_PASS = "Password07";
-
-#define TOPIC_MODE     "mobil/mode"
-#define TOPIC_COMMAND  "mobil/command"
-#define TOPIC_WAYPOINT "mobil/waypoint"
-
-/* ===================== MOTOR PIN (L298N) ===================== */
+/* ================= PIN ================= */
 #define ENA 25
+#define ENB 33
 #define IN1 26
 #define IN2 27
-#define ENB 14
 #define IN3 12
 #define IN4 13
 
-/* ===================== ENCODER ===================== */
-#define ENC_L_A 34
-#define ENC_L_B 35
-#define ENC_R_A 32
-#define ENC_R_B 33
+#define ENC_L 32
+#define ENC_R 35
 
-volatile long encLeft = 0;
-volatile long encRight = 0;
-
-/* ===================== ULTRASONIC ===================== */
 #define TRIG_PIN 4
 #define ECHO_PIN 5
 
-/* ===================== PWM ===================== */
+#define BUZZER_PIN 14
+
+/* ================= PARAM ================= */
 #define PWM_FREQ 20000
 #define PWM_RES  8
 
-/* ===================== NAV PARAM ===================== */
-const float PULSE_PER_METER = 810.0;
-const float BASE_SPEED = 0.18;
-const float HEADING_KP = 0.015;
-const float TARGET_RADIUS = 0.20;
+#define BASE_PWM 180
+#define TURN_PWM 150
+#define BACK_PWM 150
 
-const float OBSTACLE_DIST = 30.0;
-const int BACK_TIME = 300;
-const int TURN_TIME = 400;
+#define OBSTACLE_CM 25
+#define CLEAR_CM    35
 
-/* ===================== MODE & STATE ===================== */
+#define TURN_TOL 3.0
+#define STOP_TOL_CM 3.0
+
+#define PULSE_PER_REV 506
+#define WHEEL_DIAMETER_CM 6.5
+#define CM_PER_PULSE ((3.1416 * WHEEL_DIAMETER_CM) / PULSE_PER_REV)
+
+/* ================= WIFI & MQTT ================= */
+const char* WIFI_SSID = "XXX";
+const char* WIFI_PASS = "Abcdefghijklmn";
+
+const char* MQTT_HOST = "3d334b6b47764fffb7480823a8402c8c.s1.eu.hivemq.cloud";
+const int MQTT_PORT = 8883;
+const char* MQTT_USER = "mobil";
+const char* MQTT_PASS = "Password07";
+
+WiFiClientSecure net;
+PubSubClient mqtt(net);
+
+/* ================= SENSOR ================= */
+QMC5883LCompass compass;
+
+/* ================= STATE ================= */
 enum Mode { MANUAL, AUTO };
-Mode currentMode = MANUAL;
+enum AutoState { IDLE, TURN, DRIVE, AVOID };
 
-enum State {
-  IDLE,
-  MANUAL_DRIVE,
-  AUTO_NAV,
-  OBSTACLE_REACT,
-  TARGET_REACHED
-};
-State state = IDLE;
+Mode mode = MANUAL;
+AutoState autoState = IDLE;
 
-/* ===================== ROBOT STATE ===================== */
-struct {
-  float x = 0;
-  float y = 0;
-  float heading = 0;
-  float targetX = 0;
-  float targetY = 0;
-} mobil;
+/* ================= ENCODER ================= */
+volatile long encL = 0, encR = 0;
 
-/* ===================== PID ===================== */
-struct PID {
-  float kp, ki, kd;
-  float prevError;
-  float integral;
-};
+/* ================= POSITION ================= */
+float posX = 0, posY = 0;
+float lastDist = 0;
 
-PID pidL = {35, 4, 0.8, 0, 0};
-PID pidR = {35, 4, 0.8, 0, 0};
+/* ================= TARGET ================= */
+float targetX = 0, targetY = 0;
+float targetHeading = 0;
+float targetDistanceCM = 0;
 
-float targetSpeedL = 0;
-float targetSpeedR = 0;
+/* ================= BUZZER ================= */
+bool buzzerManual = false;
+bool buzzerAuto   = false;
 
-unsigned long lastPID = 0;
-const int PID_INTERVAL = 100;
+/* ================= TELEMETRY TIMER ================= */
+unsigned long lastTelemetry = 0;
+const unsigned long TELEMETRY_INTERVAL = 500; // Send every 500ms
 
-/* ===================== MQTT ===================== */
-WiFiClientSecure espClient;
-PubSubClient mqtt(espClient);
+/* ================= ISR ================= */
+void IRAM_ATTR encL_ISR(){ encL++; }
+void IRAM_ATTR encR_ISR(){ encR++; }
 
-/* ===================== COMPASS ===================== */
-Adafruit_HMC5883_Unified compass = Adafruit_HMC5883_Unified(12345);
-float OFFSET_X = -32.4;
-float OFFSET_Y = 15.8;
-
-/* ===================== INTERRUPT ===================== */
-void IRAM_ATTR encL_ISR() {
-  encLeft += digitalRead(ENC_L_B) ? 1 : -1;
-}
-void IRAM_ATTR encR_ISR() {
-  encRight += digitalRead(ENC_R_B) ? 1 : -1;
+/* ================= MOTOR ================= */
+void motorStop(){ 
+  ledcWrite(ENA,0); 
+  ledcWrite(ENB,0); 
 }
 
-/* ===================== MOTOR ===================== */
-void setMotorDir(bool lf, bool lb, bool rf, bool rb) {
-  digitalWrite(IN1, lf);
-  digitalWrite(IN2, lb);
-  digitalWrite(IN3, rf);
-  digitalWrite(IN4, rb);
+void motorForward(int p){
+  digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);
+  digitalWrite(IN3,LOW);  digitalWrite(IN4,HIGH);
+  ledcWrite(ENA,p); ledcWrite(ENB,p);
 }
 
-void stopMotor() {
-  ledcWrite(ENA, 0);
-  ledcWrite(ENB, 0);
-  targetSpeedL = 0;
-  targetSpeedR = 0;
+void motorBackward(int p){
+  digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);
+  digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW);
+  ledcWrite(ENA,p); ledcWrite(ENB,p);
 }
 
-/* ===================== ULTRASONIC ===================== */
-float readUltrasonic() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long d = pulseIn(ECHO_PIN, HIGH, 25000);
-  if (d == 0) return 999;
-  return d * 0.034 / 2;
+void motorLeft(int p){
+  digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);
+  digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH);
+  ledcWrite(ENA,p); ledcWrite(ENB,p);
 }
 
-/* ===================== COMPASS ===================== */
-float normalizeAngle(float a) {
-  while (a > 180) a -= 360;
-  while (a < -180) a += 360;
-  return a;
+void motorRight(int p){
+  digitalWrite(IN1,HIGH); digitalWrite(IN2,LOW);
+  digitalWrite(IN3,HIGH); digitalWrite(IN4,LOW);
+  ledcWrite(ENA,p); ledcWrite(ENB,p);
 }
 
-float readCompass() {
-  sensors_event_t e;
-  compass.getEvent(&e);
-
-  float x = e.magnetic.x - OFFSET_X;
-  float y = e.magnetic.y - OFFSET_Y;
-
-  float h = atan2(y, x) * 180 / PI;
-  if (h < 0) h += 360;
+/* ================= SENSOR ================= */
+float heading(){
+  compass.read();
+  int h = compass.getAzimuth();
+  if(h < 0) h += 360;
   return h;
 }
 
-/* ===================== ODOMETRY ===================== */
-long lastEncL = 0, lastEncR = 0;
-
-void updateOdometry() {
-  long dL = encLeft - lastEncL;
-  long dR = encRight - lastEncR;
-  lastEncL = encLeft;
-  lastEncR = encRight;
-
-  float dist = ((dL + dR) / 2.0) / PULSE_PER_METER;
-  mobil.x += dist * cos(mobil.heading * DEG_TO_RAD);
-  mobil.y += dist * sin(mobil.heading * DEG_TO_RAD);
+float headingErr(float t, float c){
+  float e = t - c;
+  if(e > 180) e -= 360;
+  if(e < -180) e += 360;
+  return e;
 }
 
-/* ===================== PID ===================== */
-int computePID(PID &pid, float target, float current) {
-  float error = target - current;
-  pid.integral += error * (PID_INTERVAL / 1000.0);
-  pid.integral = constrain(pid.integral, -50, 50);
-
-  float d = (error - pid.prevError) / (PID_INTERVAL / 1000.0);
-  pid.prevError = error;
-
-  float out = pid.kp * error + pid.ki * pid.integral + pid.kd * d;
-  return constrain(out, 0, 255);
+float distanceCM(){
+  return ((encL + encR)/2.0) * CM_PER_PULSE;
 }
 
-void updatePID() {
-  if (currentMode != AUTO) return;
-  if (millis() - lastPID < PID_INTERVAL) return;
-  lastPID = millis();
-
-  static long prevL = 0, prevR = 0;
-  float speedL = (encLeft - prevL) / PULSE_PER_METER / (PID_INTERVAL / 1000.0);
-  float speedR = (encRight - prevR) / PULSE_PER_METER / (PID_INTERVAL / 1000.0);
-  prevL = encLeft;
-  prevR = encRight;
-
-  ledcWrite(ENA, computePID(pidL, targetSpeedL, speedL));
-  ledcWrite(ENB, computePID(pidR, targetSpeedR, speedR));
+long ultrasonic(){
+  digitalWrite(TRIG_PIN,LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN,HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN,LOW);
+  long d = pulseIn(ECHO_PIN,HIGH,25000);
+  if(d==0) return 999;
+  return d*0.034/2;
 }
 
-/* ===================== AUTO NAV ===================== */
-bool lastTurnLeft = true;
+/* ================= POSITION UPDATE ================= */
+void updatePosition(){
+  float d = distanceCM();
+  float delta = d - lastDist;
+  lastDist = d;
 
-void autoNavigation() {
-  if (readUltrasonic() < OBSTACLE_DIST) {
-    stopMotor();
-    state = OBSTACLE_REACT;
-    return;
-  }
-
-  float dx = mobil.targetX - mobil.x;
-  float dy = mobil.targetY - mobil.y;
-
-  float dist = sqrt(dx*dx + dy*dy);
-  if (dist < TARGET_RADIUS) {
-    stopMotor();
-    state = TARGET_REACHED;
-    return;
-  }
-
-  float targetAngle = atan2(dy, dx) * 180 / PI;
-  float err = normalizeAngle(targetAngle - mobil.heading);
-
-  float diff = constrain(HEADING_KP * err, -0.1, 0.1);
-
-  targetSpeedL = BASE_SPEED - diff;
-  targetSpeedR = BASE_SPEED + diff;
-
-  setMotorDir(HIGH, LOW, LOW, HIGH);
+  float rad = heading() * DEG_TO_RAD;
+  posX += delta * cos(rad);
+  posY += delta * sin(rad);
 }
 
-void obstacleReact() {
-  setMotorDir(LOW, HIGH, LOW, HIGH);
-  ledcWrite(ENA, 120);
-  ledcWrite(ENB, 120);
-  delay(BACK_TIME);
-  stopMotor();
+/* ================= SEND TELEMETRY ================= */
+void sendTelemetry(){
+  unsigned long now = millis();
+  if(now - lastTelemetry < TELEMETRY_INTERVAL) return;
+  lastTelemetry = now;
 
-  bool turnLeft = lastTurnLeft;
-  lastTurnLeft = !lastTurnLeft;
-
-  if (turnLeft)
-    setMotorDir(LOW, HIGH, LOW, HIGH);
-  else
-    setMotorDir(HIGH, LOW, HIGH, LOW);
-
-  ledcWrite(ENA, 120);
-  ledcWrite(ENB, 120);
-  delay(TURN_TIME);
-  stopMotor();
-
-  state = AUTO_NAV;
-}
-
-/* ===================== MQTT CALLBACK ===================== */
-void mqttCallback(char* topic, byte* payload, unsigned int len) {
   StaticJsonDocument<256> doc;
-  deserializeJson(doc, payload, len);
+  doc["x"] = posX / 100.0; // Convert to meters
+  doc["y"] = posY / 100.0; // Convert to meters
+  doc["heading"] = heading();
+  doc["speed"] = 0; // Calculate from encoder delta if needed
+  doc["front_distance"] = ultrasonic();
+  doc["mode"] = (mode == MANUAL) ? "manual" : "auto";
+  
+  char buf[256];
+  serializeJson(doc, buf);
+  mqtt.publish("mobil/telemetry", buf);
+}
 
-  if (strcmp(topic, TOPIC_MODE) == 0) {
-    currentMode = doc["mode"] == "auto" ? AUTO : MANUAL;
-    stopMotor();
-    state = (currentMode == AUTO) ? AUTO_NAV : MANUAL_DRIVE;
+/* ================= CALCULATE TARGET ================= */
+void calculateTarget(float tx, float ty){
+  // Calculate angle and distance from current position to target
+  float dx = tx * 100 - posX; // Convert target to cm
+  float dy = ty * 100 - posY;
+  
+  targetDistanceCM = sqrt(dx*dx + dy*dy);
+  targetHeading = atan2(dy, dx) * 180 / PI;
+  
+  if(targetHeading < 0) targetHeading += 360;
+  
+  targetX = tx;
+  targetY = ty;
+}
+
+/* ================= MQTT CALLBACK ================= */
+void callback(char* topic, byte* payload, unsigned int len){
+  StaticJsonDocument<256> doc;
+  if(deserializeJson(doc,payload,len)) return;
+
+  String t = topic;
+
+  if(t == "mobil/command"){
+    mode = MANUAL;
+    autoState = IDLE;
+
+    String c = doc["cmd"];
+    int p = doc["speed"] | BASE_PWM;
+
+    if(c == "forward") motorForward(p);
+    else if(c == "backward") motorBackward(p);
+    else if(c == "left") motorLeft(p);
+    else if(c == "right") motorRight(p);
+    else if(c == "stop") motorStop();
+    else motorStop();
   }
 
-  if (strcmp(topic, TOPIC_WAYPOINT) == 0) {
-    mobil.targetX = doc["x"];
-    mobil.targetY = doc["y"];
-    state = AUTO_NAV;
+  if(t == "mobil/mode"){
+    String m = doc["mode"];
+    if(m == "manual"){
+      mode = MANUAL;
+      autoState = IDLE;
+      motorStop();
+    }
   }
 
-  if (strcmp(topic, TOPIC_COMMAND) == 0 && currentMode == MANUAL) {
-    String cmd = doc["cmd"];
-    int pwm = constrain(doc["speed"], 0, 255);
+  if(t == "mobil/waypoint"){
+    mode = AUTO;
+    autoState = TURN;
 
-    if (cmd == "forward") setMotorDir(HIGH, LOW, LOW, HIGH);
-    else if (cmd == "backward") setMotorDir(LOW, HIGH, HIGH, LOW);
-    else if (cmd == "left") setMotorDir(LOW, HIGH, LOW, HIGH);
-    else if (cmd == "right") setMotorDir(HIGH, LOW, HIGH, LOW);
-    else { stopMotor(); return; }
+    float tx = doc["x"];
+    float ty = doc["y"];
+    
+    calculateTarget(tx, ty);
+    
+    encL = encR = 0;
+    lastDist = 0;
+    
+    Serial.print("New waypoint: (");
+    Serial.print(tx);
+    Serial.print(", ");
+    Serial.print(ty);
+    Serial.print(") - Distance: ");
+    Serial.print(targetDistanceCM);
+    Serial.print(" cm, Heading: ");
+    Serial.println(targetHeading);
+  }
 
-    ledcWrite(ENA, pwm);
-    ledcWrite(ENB, pwm);
+  if(t == "mobil/buzzer"){
+    buzzerManual = (doc["state"] == "on");
   }
 }
 
-/* ===================== SETUP ===================== */
-void setup() {
+/* ================= SETUP ================= */
+void setup(){
   Serial.begin(115200);
 
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
+  pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
 
-  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(TRIG_PIN,OUTPUT);
+  pinMode(ECHO_PIN,INPUT);
+  pinMode(BUZZER_PIN,OUTPUT);
 
-  pinMode(ENC_L_A, INPUT_PULLUP);
-  pinMode(ENC_L_B, INPUT_PULLUP);
-  pinMode(ENC_R_A, INPUT_PULLUP);
-  pinMode(ENC_R_B, INPUT_PULLUP);
+  ledcAttach(ENA,PWM_FREQ,PWM_RES);
+  ledcAttach(ENB,PWM_FREQ,PWM_RES);
 
-  attachInterrupt(ENC_L_A, encL_ISR, CHANGE);
-  attachInterrupt(ENC_R_A, encR_ISR, CHANGE);
+  pinMode(ENC_L,INPUT);
+  pinMode(ENC_R,INPUT);
+  attachInterrupt(ENC_L,encL_ISR,RISING);
+  attachInterrupt(ENC_R,encR_ISR,RISING);
 
-  ledcAttach(ENA, PWM_FREQ, PWM_RES);
-  ledcAttach(ENB, PWM_FREQ, PWM_RES);
+  Wire.begin(21,19);
+  compass.init();
 
-  compass.begin();
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(WIFI_SSID,WIFI_PASS);
+  while(WiFi.status() != WL_CONNECTED){
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected!");
 
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) delay(500);
-
-  espClient.setInsecure();
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(mqttCallback);
+  net.setInsecure();
+  mqtt.setServer(MQTT_HOST,MQTT_PORT);
+  mqtt.setCallback(callback);
+  mqtt.setKeepAlive(60);
 }
 
-/* ===================== LOOP ===================== */
-void loop() {
-  if (!mqtt.connected()) {
-    mqtt.connect("ESP32_mobil", MQTT_USER, MQTT_PASS);
-    mqtt.subscribe(TOPIC_MODE);
-    mqtt.subscribe(TOPIC_WAYPOINT);
-    mqtt.subscribe(TOPIC_COMMAND);
+/* ================= RECONNECT MQTT ================= */
+void reconnectMQTT(){
+  while(!mqtt.connected()){
+    Serial.print("Connecting to MQTT...");
+    if(mqtt.connect("ESP32_FINAL", MQTT_USER, MQTT_PASS)){
+      Serial.println("Connected!");
+      mqtt.subscribe("mobil/command");
+      mqtt.subscribe("mobil/mode");
+      mqtt.subscribe("mobil/waypoint");
+      mqtt.subscribe("mobil/buzzer");
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(mqtt.state());
+      Serial.println(" Retrying in 5s...");
+      delay(5000);
+    }
   }
+}
 
+/* ================= LOOP ================= */
+void loop(){
+  if(!mqtt.connected()){
+    reconnectMQTT();
+  }
   mqtt.loop();
 
-  mobil.heading = readCompass();
-  updateOdometry();
+  long obs = ultrasonic();
 
-  if (currentMode == AUTO) updatePID();
+  buzzerAuto = (mode == AUTO && obs < OBSTACLE_CM);
+  digitalWrite(BUZZER_PIN, buzzerAuto || buzzerManual);
 
-  if (state == AUTO_NAV) autoNavigation();
-  else if (state == OBSTACLE_REACT) obstacleReact();
+  // Send telemetry periodically
+  sendTelemetry();
+
+  if(mode != AUTO) return;
+
+  if(autoState == DRIVE){
+    updatePosition();
+  }
+
+  if(autoState == TURN){
+    float e = headingErr(targetHeading, heading());
+    if(abs(e) <= TURN_TOL){
+      motorStop(); 
+      encL = encR = 0; 
+      lastDist = 0;
+      autoState = DRIVE; 
+      Serial.println("Turn complete, starting drive");
+      return;
+    }
+    if(e > 0) motorRight(TURN_PWM);
+    else motorLeft(TURN_PWM);
+  }
+
+  if(autoState == DRIVE){
+    if(obs < OBSTACLE_CM){ 
+      motorStop(); 
+      autoState = AVOID;
+      Serial.println("Obstacle detected!");
+      return; 
+    }
+    
+    float traveled = distanceCM();
+    if(traveled >= targetDistanceCM - STOP_TOL_CM){
+      motorStop(); 
+      autoState = IDLE; 
+      mode = MANUAL;
+      Serial.println("Destination reached!");
+      return;
+    }
+    motorForward(BASE_PWM);
+  }
+
+  if(autoState == AVOID){
+    motorBackward(BACK_PWM); 
+    delay(300);
+    motorRight(TURN_PWM); 
+    delay(400);
+    motorStop();
+    
+    if(ultrasonic() > CLEAR_CM){
+      autoState = DRIVE;
+      Serial.println("Path clear, resuming");
+    }
+  }
 }
